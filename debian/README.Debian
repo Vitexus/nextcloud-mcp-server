@@ -26,8 +26,9 @@ to Depends once python3-qdrant-client is installable via apt.
 fastembed is blocked on a substantial Rust crate-packaging effort — see
 "fastembed / tokenizers Rust crate gap" below.
 
-CI Test-stage gap: Jenkins build agent likely has a stale cached vitexsoftware/<dist> image
------------------------------------------------------------------------------------------------
+CI Test-stage gap (ROOT CAUSE CONFIRMED): python3-opentelemetry-api is not
+published for debian:bookworm, ubuntu:jammy, or ubuntu:noble
+------------------------------------------------------------------------------
 
 As of 2026-07-11, every sibling OpenTelemetry/mistralai/qdrant-client
 Jenkins job (Foregin/python-opentelemetry-*, Foregin/mistralai,
@@ -37,66 +38,77 @@ archiving steps succeed first (confirmed via archived .deb artifacts and
 clean build logs with no ValueError/dpkg-buildpackage: error) — the
 packaging itself is correct.
 
-Root cause, confirmed by reading the actual Jenkins Test-stage log
-(Foregin/python-opentelemetry-semantic-conventions build #3): the
-shared Jenkinsfile's "Test <dist>" stage does
-`sudo apt-get -y install python3-<pkg>` inside a
-vitexsoftware/<dist> container against the live apt sources (Debian
-archive + repo.vitexsoftware.com). That install fails with:
+Investigation history (kept for anyone retracing this): the shared
+Jenkinsfile's "Test <dist>" stage does
+`sudo apt-get -y install python3-<pkg>` inside a vitexsoftware/<dist>
+container, and it fails with:
 
   python3-opentelemetry-semantic-conventions : Depends: python3-typing-extensions (>= 4.5.0) but it is not going to be installed
                                                Depends: python3-opentelemetry-api (>= 1.41.1) but it is not installable
   E: Unable to correct problems, you have held broken packages.
 
-At first this looked like it was caused by repo.vitexsoftware.com's
-backports component 403ing/404ing on every distribution (visible in the
-same logs as "E: Failed to fetch .../backports/binary-amd64/Packages
-... 403 Forbidden" / "404 Not Found" across bookworm/trixie/jammy/
-noble/resolute). That symptom is now GONE (verified 2026-07-11: all
-five distros' backports indexes return HTTP 200, and build #4's log
-shows every distro fetching backports cleanly) — but the exact same
-"python3-opentelemetry-api ... not installable" failure still occurs.
+Two earlier theories were tested and disproven with SSH access to the
+actual Jenkins host (jenkins@vyvojar.spoje.net):
 
-This was reproduced and disproven as a repo problem twice:
+1. NOT a repo.vitexsoftware.com backports outage — that symptom (403s
+   on the backports component) was real and transient early on
+   2026-07-11 but resolved itself; retested well after a fresh
+   RebulidDEBRepoByAnsible run and the failure persisted identically.
+2. NOT a stale cached vitexsoftware/<dist> Docker image on the Jenkins
+   build agent — reproduced the exact Test-stage command (local .deb
+   served via `file://` + repo.vitexsoftware.com + the Debian/Ubuntu
+   archive) directly on the Jenkins host using the real
+   vitexsoftware/debian:trixie image, including 5 concurrent parallel
+   runs to rule out resource contention. All succeeded cleanly.
 
-1. A clean `debian:trixie` container (not the custom
-   vitexsoftware/trixie Jenkins image), configured with the same
-   repo.vitexsoftware.com apt source and signing key, installs
-   `python3-opentelemetry-api` + `python3-typing-extensions` together
-   with a completely clean dependency resolution (no held/broken
-   packages).
-2. Full end-to-end reproduction of the actual Jenkins Test-stage
-   command: built python3-opentelemetry-semantic-conventions_0.64b0-1
-   locally, served it from a local `file://` apt repo exactly as the
-   Jenkinsfile does, and ran
-   `apt-get install python3-opentelemetry-semantic-conventions` in a
-   clean debian:trixie container against local-repo + repo.vitexsoftware.com
-   + the Debian archive simultaneously. It installed cleanly —
-   typing-extensions, opentelemetry-api, and the package itself all
-   unpack and configure with zero unmet dependencies. This is the exact
-   command Jenkins runs and it works fine outside Jenkins.
+The above two theories only ever tested debian:trixie/bookworm — the
+actual root cause only shows up on Ubuntu. Repeating the identical
+reproduction against vitexsoftware/ubuntu:jammy and
+vitexsoftware/ubuntu:noble reproduces the exact Jenkins failure:
 
-Confirmed retested 2026-07-11 ~18:30, well after a fresh
-RebulidDEBRepoByAnsible run (#8388, completed 18:18) — ruling out the
-"still mid-rebuild" explanation too; the Jenkins job (build #5) failed
-with the identical error at that point. So the live apt repository is
-healthy right now, under every scenario tested.
+  python3-opentelemetry-api:
+    Installed: (none)
+    Candidate: (none)
+    Version table:
 
-That points at the Jenkins build agent's own environment: the
-Jenkinsfile does `buildImage = docker.image(vendor + '/' + distro)`
-then `buildImage.inside { ... }` without ever calling `.pull()` on it,
-so the Jenkins host almost certainly runs off a **locally cached,
-possibly stale** `vitexsoftware/<dist>` image (baked apt package lists
-or `/etc/apt/preferences` pins from whenever it was last pulled) rather
-than re-resolving against the live repo state. Fix candidates for
-whoever has Jenkins-host access: `docker pull vitexsoftware/{bookworm,
-trixie,jammy,noble,resolute}` on the build agent, or add `.pull()` (or
-an `--pull always` build-arg equivalent) to the Jenkinsfile's
-`docker.image(...)` calls so each build always starts from a fresh
-image. This needs Jenkins-host access not available in this
-environment; a Debian package built locally with
+`apt-cache policy` returns nothing at all for the package name on
+bookworm and jammy, and "Candidate: (none)" on noble — i.e.
+python3-opentelemetry-api was simply never built/published to
+repo.vitexsoftware.com for these three distributions. It only exists
+for debian:trixie and ubuntu:resolute. This is a pre-existing gap in
+the opentelemetry-api package itself (it predates this packaging
+session — see the version-pin-relaxation comments throughout this
+dependency tree's debian/rules files, e.g. "Debian's archived
+python3-opentelemetry-api is only 1.41.1-1.2~trixie").
+
+Because every OpenTelemetry package transitively depends on
+python3-opentelemetry-api, and the shared Jenkinsfile fails the whole
+build if any one of its 5 parallel `stage('Test ' + distroName)`
+branches fails, every job in this dependency chain (and mistralai,
+which pulls in the same chain) is guaranteed to fail on 3 of 5 distros
+every single time — independent of repo health, image freshness, or
+timing. This explains why tasks #6/#7/#8/#9/#13/#15 were previously
+(wrongly) marked "completed": they were verified only via a local
+`dpkg-buildpackage -us -uc -b`, which never exercises the multi-distro
+Test stage where this gap actually bites.
+
+A secondary, unrelated finding while investigating jammy/noble: Ubuntu
+resolute ships its own native python3-opentelemetry-semantic-conventions
+1.39.1-2 (and python3-opentelemetry-api) in universe. Since dpkg version
+"1.39.1-2" numerically outranks our locally-built "0.64b0-1", an
+unversioned `apt-get install python3-opentelemetry-semantic-conventions`
+on resolute silently installs Ubuntu's unrelated native package instead
+of testing ours — a separate Test-stage false-positive worth fixing
+(e.g. pin the exact local version in the install command) once the
+python3-opentelemetry-api gap above is closed.
+
+Fix needed: publish python3-opentelemetry-api (and transitively
+python3-opentelemetry-semantic-conventions and anything else already
+built) for debian:bookworm, ubuntu:jammy, and ubuntu:noble in
+repo.vitexsoftware.com. A Debian package built locally with
 `dpkg-buildpackage -us -uc -b` is correct even though its Jenkins CI
-Test stage cannot currently verify installability end-to-end.
+Test stage cannot currently verify installability on 3 of 5 target
+distributions.
 
 Build fix: unrecognized trove classifiers
 -------------------------------------------
