@@ -57,13 +57,30 @@ five distros' backports indexes return HTTP 200, and build #4's log
 shows every distro fetching backports cleanly) — but the exact same
 "python3-opentelemetry-api ... not installable" failure still occurs.
 
-This was reproduced and disproven as a repo problem: a clean
-`debian:trixie` container (not the custom vitexsoftware/trixie Jenkins
-image), configured with the same repo.vitexsoftware.com apt source and
-signing key, installs `python3-opentelemetry-api` +
-`python3-typing-extensions` together with a completely clean dependency
-resolution (no held/broken packages). So the live apt repository itself
-is healthy right now.
+This was reproduced and disproven as a repo problem twice:
+
+1. A clean `debian:trixie` container (not the custom
+   vitexsoftware/trixie Jenkins image), configured with the same
+   repo.vitexsoftware.com apt source and signing key, installs
+   `python3-opentelemetry-api` + `python3-typing-extensions` together
+   with a completely clean dependency resolution (no held/broken
+   packages).
+2. Full end-to-end reproduction of the actual Jenkins Test-stage
+   command: built python3-opentelemetry-semantic-conventions_0.64b0-1
+   locally, served it from a local `file://` apt repo exactly as the
+   Jenkinsfile does, and ran
+   `apt-get install python3-opentelemetry-semantic-conventions` in a
+   clean debian:trixie container against local-repo + repo.vitexsoftware.com
+   + the Debian archive simultaneously. It installed cleanly —
+   typing-extensions, opentelemetry-api, and the package itself all
+   unpack and configure with zero unmet dependencies. This is the exact
+   command Jenkins runs and it works fine outside Jenkins.
+
+Confirmed retested 2026-07-11 ~18:30, well after a fresh
+RebulidDEBRepoByAnsible run (#8388, completed 18:18) — ruling out the
+"still mid-rebuild" explanation too; the Jenkins job (build #5) failed
+with the identical error at that point. So the live apt repository is
+healthy right now, under every scenario tested.
 
 That points at the Jenkins build agent's own environment: the
 Jenkinsfile does `buildImage = docker.image(vendor + '/' + distro)`
