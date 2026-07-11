@@ -65,7 +65,7 @@ services:
       - ./tests/fixtures/nginx.conf:/etc/nginx/nginx.conf:ro
 
   unstructured:
-    image: downloads.unstructured.io/unstructured-io/unstructured-api:0.1.7@sha256:ee89a87a545b6a7d56609607aced71b5b1acf0211400bf2d11a8f70f209a93bd
+    image: downloads.unstructured.io/unstructured-io/unstructured-api:0.1.8@sha256:cd18ed5ac5e0284f4d7647774e63863190b0bad4b765a049cfc91c643c55396c
     restart: always
     ports:
       - 127.0.0.1:8005:8000
@@ -191,6 +191,17 @@ services:
       - ENABLE_DOCLING=${ENABLE_DOCLING:-false}
       - DOCLING_API_URL=${DOCLING_API_URL:-}
       - DOCLING_TIMEOUT=${DOCLING_TIMEOUT:-120}
+      # Opt-in VLM pipeline (ADR-032): point docling-serve at its VLM presets
+      # instead of classic OCR. Default "standard" is byte-identical to the
+      # pre-VLM request. VLM is slow (~90-200s/page): for bulk indexing use the
+      # async ingest path (DOCUMENT_OCR_PROVIDER=docling) and raise
+      # DOCUMENT_OCR_TIMEOUT_SECONDS -- do NOT inflate DOCLING_TIMEOUT (interactive).
+      - DOCLING_PIPELINE=${DOCLING_PIPELINE:-standard}
+      - DOCLING_VLM_PRESET=${DOCLING_VLM_PRESET:-}
+      # Opt-in cap on the synchronous nc_webdav_read_file parse; empty = disabled.
+      # A client-friendly bound (e.g. 45-60) makes a slow VLM/OCR read fall back to
+      # base64 fast instead of blocking past the MCP client's own timeout.
+      - DOCUMENT_READ_TIMEOUT_SECONDS=${DOCUMENT_READ_TIMEOUT_SECONDS:-}
     profiles:
       - single-user
 
@@ -258,7 +269,7 @@ services:
       - multi-user-basic
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.6.4@sha256:0aae0de7fca85525f727d3354df17896092de8bb26ae4c12d89c77e5df8cbce4
+    image: quay.io/keycloak/keycloak:26.7.0@sha256:2eb3cd316835c990e69e26ade292ffa78f6fb0db7d5fc6377463c162e1979ac0
     command:
       - "start-dev"
       - "--import-realm"
@@ -445,7 +456,7 @@ services:
   # Bring up with:  docker compose --profile postgres up -d postgres-test
   # See ADR-026 for the pluggable-database-backend design.
   postgres-test:
-    image: docker.io/library/postgres:18-alpine@sha256:1b1689b20d16a014a3d195653381cf2caa75a41a92d93b255a9d6ea29fd353aa
+    image: docker.io/library/postgres:18-alpine@sha256:ecafd34249b5c248f3cb6ebe339584ee6448b36fad3f0a827ae5e8efbae6afda
     restart: unless-stopped
     environment:
       POSTGRES_USER: mcp
@@ -494,7 +505,7 @@ services:
   # backends can't produce. Bootstrapped fresh on every `up` (no data volume),
   # so the custom LDIF is always applied.
   openldap:
-    image: docker.io/vegardit/openldap:2.6.10@sha256:0f24ff1d4ec0faa560fd88fd9da80f37a404ca849b57c5ec1fe911fb0c1967b6
+    image: docker.io/vegardit/openldap:2.6.10@sha256:fd9af3fd925cda6409ea62156ce9002798bcc4c86eddc4178f137888a2e176d4
     environment:
       - LDAP_INIT_ORG_DN=dc=example,dc=org
       - LDAP_INIT_ORG_NAME=Example Org
