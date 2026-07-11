@@ -1,0 +1,25 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@ --with python3 --buildsystem=pybuild
+
+override_dh_auto_configure:
+	# Upstream declares build-backend = "uv_build" (pyproject.toml
+	# [build-system]), which is not packaged in Debian (no
+	# python3-uv-build; `python3 -c "import uv_build"` fails). Swap to
+	# hatchling, which is packaged, and tell it explicitly where the
+	# importable package lives: the module root is the repository root
+	# (not src/), per [tool.uv.build-backend] module-root = "" upstream.
+	sed -i 's/requires = \["uv_build.*"\]/requires = ["hatchling"]/' pyproject.toml
+	sed -i 's/build-backend = "uv_build"/build-backend = "hatchling.build"/' pyproject.toml
+	printf '\n[tool.hatch.build.targets.wheel]\npackages = ["nextcloud_mcp_server"]\n' >> pyproject.toml
+	dh_auto_configure
+
+override_dh_auto_test:
+	# Skip tests: several test/runtime dependencies (qdrant-client,
+	# fastembed, anthropic, langchain-text-splitters, pymupdf4llm,
+	# pypdfium2) are not yet packaged for Debian, see debian/README.Debian.
+
+override_dh_auto_clean:
+	dh_auto_clean
+	git checkout pyproject.toml 2>/dev/null || true
