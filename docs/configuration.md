@@ -346,43 +346,58 @@ OLLAMA_BASE_URL=http://ollama:11434
 
 > **Note:** In multi-user modes (Login Flow v2, Multi-User BasicAuth), enabling `ENABLE_SEMANTIC_SEARCH` automatically enables background operations and refresh token storage. You don't need to set `ENABLE_BACKGROUND_OPERATIONS` separately!
 
-### Search Mode: Keyword-Only (Airgapped) — `SEARCH_MODE`
+### Per-document keyword vs hybrid indexing — `VECTOR_SYNC_KEYWORD_TAG`
 
-`SEARCH_MODE` selects how indexed content is searched (ADR-030):
+Documents are indexed **hybrid** (dense semantic + BM25 sparse) or
+**keyword-only** (BM25 sparse) **per document**, chosen by which Nextcloud system
+tag the file carries (ADR-031). Both live in **one collection** and are returned
+by a single unified search.
 
-| Value | Behavior | Embedding endpoint |
-|-------|----------|--------------------|
-| `hybrid` (default) | Dense semantic vectors **+** BM25 sparse vectors, fused in Qdrant | **Required** (Ollama/Bedrock/OpenAI/Mistral/gateway) |
-| `keyword` | BM25 sparse (full-text/keyword) only — no dense embeddings | **None** |
+| Tag | Env var (override the tag name) | Mode | Embedding endpoint |
+|-----|---------|------|--------------------|
+| `vector-index` | `VECTOR_SYNC_TAG` (default `vector-index`) | hybrid (dense + BM25 sparse) | **Required** (Ollama/Bedrock/OpenAI/Mistral/gateway) |
+| `keyword-index` | `VECTOR_SYNC_KEYWORD_TAG` (default `keyword-index`) | keyword (BM25 sparse only) | **None** for those docs |
 
-Use `SEARCH_MODE=keyword` for fully **airgapped** deployments that cannot (or
-do not want to) run a text-embedding endpoint. You still get the unified
-cross-app Qdrant index (notes, files, OCR'd PDFs, deck cards, news, mail) and
-verify-on-read ACLs — just lexical (keyword) matching instead of conceptual
-similarity. BM25 sparse vectors are computed in-process, so no embedding service
-is contacted at ingestion or query time.
+Both tags are **on by default** — create the `vector-index` and/or `keyword-index`
+system tag in Nextcloud and apply it; no env var needed. The env vars only
+**rename** a tag, or set `VECTOR_SYNC_KEYWORD_TAG=""` to disable the keyword tag.
+
+Tag a PDF `keyword-index` to lexically index it **without** paying embedding
+cost; tag it `vector-index` to also get conceptual/semantic matching. **Hybrid
+wins** if a file carries both tags. Discovery is PDF-only, mirroring the
+`vector-index` path (tagged folders expand to their PDF descendants).
 
 ```dotenv
-# Airgapped, no embedding endpoint:
-ENABLE_SEMANTIC_SEARCH=true   # keyword mode still uses the Qdrant pipeline
-SEARCH_MODE=keyword
+ENABLE_SEMANTIC_SEARCH=true
 QDRANT_URL=http://qdrant:6333
-# (no OLLAMA_BASE_URL / Bedrock / OpenAI / gateway needed)
+# Both tags work out of the box; vector-index (hybrid) needs an embedding
+# endpoint, e.g.:
+OLLAMA_BASE_URL=http://ollama:11434
 ```
 
 Notes:
 
-- `keyword` **still requires `ENABLE_SEMANTIC_SEARCH=true`** — it uses the Qdrant
-  index. With vector sync off the search tools don't register.
-- The `nc_semantic_search` / `nc_semantic_search_answer` tools stay available;
-  results carry `search_method="bm25_keyword"`. The RAG answer tool still works
-  airgapped (retrieval via BM25, answer generated client-side via MCP sampling).
-- **Score caveat:** in keyword mode `score` is a raw BM25 value (unbounded), not
-  a normalized [0,1] fusion score, so a non-zero `score_threshold` filters very
-  differently. The `fusion` parameter is ignored.
-- **Switching modes** uses a different collection (keyword collections are named
-  `…-bm25-keyword`). Keyword and hybrid indexes are not interchangeable — to
-  switch, use a fresh collection and let background sync re-ingest.
+- Requires `ENABLE_SEMANTIC_SEARCH=true` (both tags use the Qdrant index).
+- **Unified search:** `nc_semantic_search` fuses dense + sparse. Keyword-only
+  documents contribute only their BM25 (sparse) match, so they appear in
+  bm25/hybrid results and are naturally absent from a pure-`semantic` query.
+- **Hybrid requires embeddings:** a `vector-index` document whose embedding
+  endpoint is unavailable **errors and retries** (then dead-letters) rather than
+  silently degrading to keyword-only. Only the `keyword-index` tag produces
+  sparse-only points.
+- **Fully airgapped:** the `keyword-index` tag is on by default, so just configure
+  **no** embedding provider and tag everything `keyword-index` — nothing ever
+  contacts an embedding endpoint (the local `SimpleProvider` only sizes the
+  dense slot the keyword points never populate). Note the collection is always
+  dense-sized from the *configured* provider, so if you set e.g. `OLLAMA_BASE_URL`
+  while intending to use only the keyword tag, collection creation still probes
+  that provider's dimension at startup — leave the provider env unset for a truly
+  offline stack.
+- **Retagging** a file between the two tags (unchanged content) reprocesses it:
+  keyword→`vector-index` adds a dense vector; the reverse is absorbed by the
+  dedup no-downgrade rule while any user still holds `vector-index`.
+- **Provisioning:** the `keyword-index` tag is created/exposed by the Astrolabe
+  Nextcloud app (or `occ tag:add` / the server's own `get_or_create_tag`).
 
 ### Qdrant Vector Database Modes
 
@@ -702,9 +717,12 @@ HTTP — no ML dependencies are added to the server image. Run one via the
 ```dotenv
 ENABLE_DOCLING=false                  # master switch for the docling touchpoints
 DOCLING_API_URL=http://docling:5001   # docling-serve base URL (required)
-DOCLING_TIMEOUT=120                   # image/force conversion timeout (seconds)
+DOCLING_TIMEOUT=120                   # INTERACTIVE image/force read timeout (nc_webdav_read_file); keep client-friendly
 DOCLING_OCR_LANG=en,de                # engine-dependent codes (EasyOCR: en,de; Tesseract: eng,deu)
 DOCLING_DO_OCR=true                   # run OCR (vs. text-layer extraction only)
+DOCLING_PIPELINE=standard             # "standard" (classic OCR) | "vlm" (vision-language model)
+DOCLING_VLM_PRESET=                   # VLM preset name when DOCLING_PIPELINE=vlm (unset = docling-serve default)
+DOCUMENT_READ_TIMEOUT_SECONDS=        # opt-in cap on the interactive read parse; empty = disabled (see VLM note)
 ```
 
 **Required configuration per use case** (`auto` never selects docling — it needs
@@ -715,6 +733,8 @@ an explicit self-hosted URL):
 | Images auto-route to docling | `ENABLE_DOCUMENT_PROCESSING=true` + `ENABLE_DOCLING=true` + `DOCLING_API_URL` |
 | Force docling on a text-layer PDF (`force_processor="docling"`) | `ENABLE_DOCUMENT_PROCESSING=true` + `ENABLE_DOCLING=true` + `DOCLING_API_URL` |
 | Scanned / no-text-layer PDFs auto-OCR via docling | `DOCUMENT_OCR_ENABLED=true` + `DOCUMENT_OCR_PROVIDER=docling` + `DOCLING_API_URL` |
+| **VLM** for bulk PDF indexing (async, recommended) | scanned-PDF row + `DOCLING_PIPELINE=vlm` (+ `DOCLING_VLM_PRESET`) + raise `DOCUMENT_OCR_TIMEOUT_SECONDS` (e.g. 600–900) |
+| **VLM** for interactive image/force reads | image/force row + `DOCLING_PIPELINE=vlm` (+ `DOCLING_VLM_PRESET`); expect long blocking — see the VLM note below |
 
 The scanned-PDF row deliberately omits `ENABLE_DOCLING`/`ENABLE_DOCUMENT_PROCESSING`:
 that path rides the always-registered `ocr` tier during **indexing** (so it also
@@ -750,6 +770,45 @@ convert endpoint has an observed ~2 min practical ceiling (from our testing, not
 hard server-enforced limit), so a larger `DOCLING_TIMEOUT` (e.g. 300s for slow CPU
 OCR) simply lets a slow conversion finish; very large scans are future work (async
 submit/poll). See `docs/ADR-031-docling-document-parsing-backend.md`.
+
+**VLM pipeline (opt-in).** docling-serve can also transcribe with a
+vision-language model instead of classic OCR — often markedly better on messy
+scans, handwriting and complex layouts. The pipeline is **client-selected**: set
+`DOCLING_PIPELINE=vlm` and the docling client sends `pipeline=vlm` (plus
+`DOCLING_VLM_PRESET`, if set, and a lean `image_export_mode=placeholder`) on
+**both** the image and scanned-PDF touchpoints. Presets are defined by the
+docling-serve instance (e.g. `glm_ocr` backed by a local Ollama), so the client
+does not validate the name — an unknown preset surfaces as a docling error. Under
+`vlm` the classic `DOCLING_DO_OCR`/`DOCLING_OCR_LANG` knobs are inert and not sent.
+The default `standard` is byte-identical to the pre-VLM request, so leaving it
+unset changes nothing. The chosen pipeline is recorded in
+`parsing_metadata.docling_pipeline` while `parsing_method` stays `docling`.
+
+**VLM is much slower than classic OCR (~90–200s/page), so where you run it
+matters — and the two touchpoints have independent timeouts:**
+
+- **Bulk indexing (recommended for VLM):** with `DOCUMENT_OCR_PROVIDER=docling`,
+  scanned PDFs are transcribed on the **async ingest pipeline** (`mcp_role=worker`,
+  the `ingest-ocr` queue) and written to the search index. That path uses
+  **`DOCUMENT_OCR_TIMEOUT_SECONDS`** and never blocks a tool call — raise it freely
+  (e.g. 600–900s) for VLM.
+- **Interactive reads (`nc_webdav_read_file` on images / `force_processor="docling"`):**
+  these parse **synchronously** and block for up to **`DOCLING_TIMEOUT`**. Raising
+  `DOCLING_TIMEOUT` for VLM directly lengthens that block, and MCP clients usually
+  enforce a much shorter per-tool timeout (~30–60s) — so the client typically kills
+  the call before docling responds and you see a client timeout, not the tool's
+  base64 fallback. **Do not inflate `DOCLING_TIMEOUT` to force interactive VLM.**
+  Images are interactive-only (the ingest scanner is PDF-only), so interactive VLM
+  image reads inherently block.
+
+**`DOCUMENT_READ_TIMEOUT_SECONDS` (opt-in cap).** Set it to bound the synchronous
+parse inside `nc_webdav_read_file` (via `anyio.fail_after`), independent of
+`DOCLING_TIMEOUT` and of the worker path: when the cap trips, the tool returns
+base64 **fast** instead of hanging until the client times out. Default is empty
+(disabled) — no behavior change for existing reads. Set a client-friendly bound
+(e.g. 45–60s) if you want graceful fallback; leave it unset (and expect long calls)
+if you deliberately want interactive VLM with a tolerant client. It never affects
+the async ingest/worker path. See `docs/ADR-032-docling-vlm-pipeline.md`.
 
 #### OCR execution mode: synchronous vs batch (Deck #332)
 
@@ -981,7 +1040,7 @@ aware of:
   an excluded folder) drops out of results immediately rather than waiting for
   the scanner sweep. The REPORT expands tagged folders via a `Depth: infinity`
   SEARCH, so deployments that tag whole directory trees pay that walk once per
-  search; configure `VECTOR_SYNC_PDF_TAG` to change the tag name. The `file`
+  search; configure `VECTOR_SYNC_TAG` to change the tag name. The `file`
   verifier's latency therefore scales with **both** the `Depth: infinity` folder
   expansion **and** the `EXCLUDED_TAGS` lookup: that lookup fans out ~2 WebDAV
   calls (1 PROPFIND + 1 REPORT) *per excluded tag*, concurrently, while holding
@@ -1023,7 +1082,8 @@ equivalent.** Operators who need a runtime toggle should open an issue.
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `ENABLE_SEMANTIC_SEARCH` | ⚠️ Optional | `false` | Enable semantic search with background indexing (replaces `VECTOR_SYNC_ENABLED`) |
-| `SEARCH_MODE` | ⚠️ Optional | `hybrid` | `hybrid` (dense+sparse) or `keyword` (BM25 sparse only, no embedding endpoint — airgapped, ADR-030). `keyword` still requires `ENABLE_SEMANTIC_SEARCH=true` |
+| `VECTOR_SYNC_TAG` | ⚠️ Optional | `vector-index` | Nextcloud tag marking files for **hybrid** (dense + BM25 sparse) indexing (ADR-031) |
+| `VECTOR_SYNC_KEYWORD_TAG` | ⚠️ Optional | `keyword-index` | Nextcloud tag marking files for **keyword-only** (BM25 sparse) indexing into the same collection; on by default, set empty to disable. Hybrid wins if a file carries both tags (ADR-031) |
 | `QDRANT_URL` | ⚠️ Optional | - | Qdrant service URL (network mode) - mutually exclusive with `QDRANT_LOCATION` |
 | `QDRANT_LOCATION` | ⚠️ Optional | `:memory:` | Local Qdrant path (`:memory:` or `/path/to/data`) - mutually exclusive with `QDRANT_URL` |
 | `QDRANT_API_KEY` | ⚠️ Optional | - | Qdrant API key (network mode only) |

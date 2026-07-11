@@ -128,7 +128,10 @@ from nextcloud_mcp_server.server import (
 )
 from nextcloud_mcp_server.server.auth_tools import register_auth_tools
 from nextcloud_mcp_server.server.oauth_tools import register_oauth_tools
-from nextcloud_mcp_server.vector.metrics_publisher import vector_sync_metrics_task
+from nextcloud_mcp_server.vector.metrics_publisher import (
+    vector_density_snapshot_task,
+    vector_sync_metrics_task,
+)
 from nextcloud_mcp_server.vector.oauth_sync import (
     ProvisionSignal,
     credential_cleanup_task,
@@ -272,6 +275,8 @@ def initialize_document_processors():
                 timeout=docling_config["timeout"],
                 ocr_lang=docling_config["ocr_lang"],
                 do_ocr=docling_config["do_ocr"],
+                pipeline=docling_config.get("pipeline", "standard"),
+                vlm_preset=docling_config.get("vlm_preset"),
                 progress_interval=docling_config.get("progress_interval", 10),
             )
             registry.register(processor, priority=20)  # Above unstructured (10)
@@ -1717,28 +1722,10 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
 
     # Register semantic search tools (cross-app feature)
     if settings.vector_sync_enabled:
-        if settings.dense_enabled:
-            logger.info(
-                "Configuring search tools (vector sync enabled, SEARCH_MODE=hybrid)"
-            )
-        else:
-            logger.info(
-                "Configuring search tools (vector sync enabled, SEARCH_MODE=keyword):"
-                " dense embeddings disabled; BM25 keyword search only — no embedding"
-                " endpoint required (ADR-030)"
-            )
+        logger.info("Configuring search tools (vector sync enabled, hybrid search)")
         configure_semantic_tools(mcp)
     else:
         logger.info("Skipping semantic search tools (VECTOR_SYNC_ENABLED not set)")
-        if not settings.dense_enabled:
-            # keyword mode is meaningless without the Qdrant pipeline it queries;
-            # the tools just won't register. Warn rather than crash, matching the
-            # codebase's gate-don't-crash posture for search enablement.
-            logger.warning(
-                "SEARCH_MODE=keyword has no effect while VECTOR_SYNC_ENABLED is "
-                "off: keyword search uses the Qdrant index, so enable vector sync "
-                "to use it (ADR-030)"
-            )
 
     # Register OAuth provisioning tools (only when offline access is enabled)
     enable_offline_access_for_tools = settings.enable_offline_access
@@ -2147,6 +2134,12 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                     shutdown_event,
                 )
 
+                # Current-corpus chunk-density snapshot on its own slower cadence
+                # (heavier collection scroll). Opt-out via
+                # VECTOR_DENSITY_SNAPSHOT_ENABLED.
+                if settings.vector_density_snapshot_enabled:
+                    await tg.start(vector_density_snapshot_task, shutdown_event)
+
                 logger.info(
                     "Background sync tasks started: 1 scanner + %s processors (queue=%s)",
                     ingest_transport.active_consumer_count,
@@ -2377,6 +2370,12 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                         ingest_transport.receive_stream,
                         shutdown_event,
                     )
+
+                    # Current-corpus chunk-density snapshot on its own slower
+                    # cadence (heavier collection scroll). Opt-out via
+                    # VECTOR_DENSITY_SNAPSHOT_ENABLED.
+                    if settings.vector_density_snapshot_enabled:
+                        await tg.start(vector_density_snapshot_task, shutdown_event)
 
                     logger.info(
                         "Background sync tasks started: 1 user manager + %s processors (queue=%s)",
