@@ -26,8 +26,8 @@ to Depends once python3-qdrant-client is installable via apt.
 fastembed is blocked on a substantial Rust crate-packaging effort — see
 "fastembed / tokenizers Rust crate gap" below.
 
-CI Test-stage gap: repo.vitexsoftware.com backports 403s block apt installability
-------------------------------------------------------------------------------------
+CI Test-stage gap: Jenkins build agent likely has a stale cached vitexsoftware/<dist> image
+-----------------------------------------------------------------------------------------------
 
 As of 2026-07-11, every sibling OpenTelemetry/mistralai/qdrant-client
 Jenkins job (Foregin/python-opentelemetry-*, Foregin/mistralai,
@@ -40,7 +40,7 @@ packaging itself is correct.
 Root cause, confirmed by reading the actual Jenkins Test-stage log
 (Foregin/python-opentelemetry-semantic-conventions build #3): the
 shared Jenkinsfile's "Test <dist>" stage does
-`sudo apt-get -y install python3-<pkg>` inside a fresh
+`sudo apt-get -y install python3-<pkg>` inside a
 vitexsoftware/<dist> container against the live apt sources (Debian
 archive + repo.vitexsoftware.com). That install fails with:
 
@@ -48,19 +48,36 @@ archive + repo.vitexsoftware.com). That install fails with:
                                                Depends: python3-opentelemetry-api (>= 1.41.1) but it is not installable
   E: Unable to correct problems, you have held broken packages.
 
-i.e. python3-opentelemetry-api itself is not cleanly installable in the
-build container, apparently because repo.vitexsoftware.com's backports
-component 404s/403s on every distribution (bookworm/trixie/jammy/
-noble/resolute — visible earlier in the same logs as
-"E: Failed to fetch .../backports/binary-amd64/Packages ... 403
-Forbidden"), and the typing-extensions >= 4.5.0 floor needed by
-opentelemetry-semantic-conventions/opentelemetry-api apparently lives in
-that unreachable backports component. This is a repo-hosting/apt-source
-issue on repo.vitexsoftware.com, not a packaging defect, and not
-specific to any one package — every job in this batch hits it. Fixing
-it needs access to whatever serves repo.vitexsoftware.com's dists/*/
-backports tree (permissions/credentials not available in this
-environment); a Debian package built locally with
+At first this looked like it was caused by repo.vitexsoftware.com's
+backports component 403ing/404ing on every distribution (visible in the
+same logs as "E: Failed to fetch .../backports/binary-amd64/Packages
+... 403 Forbidden" / "404 Not Found" across bookworm/trixie/jammy/
+noble/resolute). That symptom is now GONE (verified 2026-07-11: all
+five distros' backports indexes return HTTP 200, and build #4's log
+shows every distro fetching backports cleanly) — but the exact same
+"python3-opentelemetry-api ... not installable" failure still occurs.
+
+This was reproduced and disproven as a repo problem: a clean
+`debian:trixie` container (not the custom vitexsoftware/trixie Jenkins
+image), configured with the same repo.vitexsoftware.com apt source and
+signing key, installs `python3-opentelemetry-api` +
+`python3-typing-extensions` together with a completely clean dependency
+resolution (no held/broken packages). So the live apt repository itself
+is healthy right now.
+
+That points at the Jenkins build agent's own environment: the
+Jenkinsfile does `buildImage = docker.image(vendor + '/' + distro)`
+then `buildImage.inside { ... }` without ever calling `.pull()` on it,
+so the Jenkins host almost certainly runs off a **locally cached,
+possibly stale** `vitexsoftware/<dist>` image (baked apt package lists
+or `/etc/apt/preferences` pins from whenever it was last pulled) rather
+than re-resolving against the live repo state. Fix candidates for
+whoever has Jenkins-host access: `docker pull vitexsoftware/{bookworm,
+trixie,jammy,noble,resolute}` on the build agent, or add `.pull()` (or
+an `--pull always` build-arg equivalent) to the Jenkinsfile's
+`docker.image(...)` calls so each build always starts from a fresh
+image. This needs Jenkins-host access not available in this
+environment; a Debian package built locally with
 `dpkg-buildpackage -us -uc -b` is correct even though its Jenkins CI
 Test stage cannot currently verify installability end-to-end.
 
