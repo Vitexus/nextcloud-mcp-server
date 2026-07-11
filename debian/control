@@ -1,0 +1,73 @@
+# NOTE on completeness: the Depends list below covers every resolvable
+# runtime dependency from pyproject.toml. Six hard runtime dependencies
+# have NO Debian package available in the apt repo yet and are therefore
+# NOT listed in Depends (see debian/README.Debian for details and
+# tracking):
+#   fastembed, anthropic, langchain-text-splitters,
+#   pymupdf4llm, pypdfium2, qdrant-client
+# The package builds cleanly but is not yet fully apt-installable as a
+# complete runtime until those land in follow-up packaging sessions.
+Source: nextcloud-mcp-server
+Section: python
+Priority: optional
+Maintainer: Vítězslav Dvořák <info@vitexsoftware.cz>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-python,
+ pybuild-plugin-pyproject,
+ python3-all,
+ python3-hatchling,
+Standards-Version: 4.7.0
+Homepage: https://github.com/cbcoutinho/nextcloud-mcp-server
+Rules-Requires-Root: no
+
+Package: nextcloud-mcp-server
+Architecture: all
+Multi-Arch: foreign
+Depends:
+ ${misc:Depends},
+ ${python3:Depends},
+ python3-mcp,
+ python3-httpx,
+ python3-pil,
+ python3-icalendar,
+ python3-pythonvcard4,
+ python3-pydantic,
+ python3-click,
+ python3-caldav,
+ python3-recurring-ical-events,
+ python3-jwt,
+ python3-cryptography,
+ python3-aiosqlite,
+ python3-alembic,
+ python3-authlib,
+ python3-boto3,
+ python3-prometheus-client,
+ python3-opentelemetry-api,
+ python3-opentelemetry-sdk,
+ python3-starlette,
+ python3-opentelemetry-instrumentation-asgi,
+ python3-opentelemetry-instrumentation-httpx,
+ python3-opentelemetry-instrumentation-logging,
+ python3-opentelemetry-exporter-otlp-proto-grpc,
+ python3-jinja2,
+ python3-markdownify,
+ python3-pymupdf,
+ python3-openai,
+ python3-dynaconf,
+ python3-mistralai,
+ python3-sqlalchemy,
+Description: Model Context Protocol server for Nextcloud integration
+ Nextcloud MCP Server implements the Model Context Protocol (MCP) so that
+ AI assistants and LLM-based agents can interact with a Nextcloud instance:
+ Notes, Calendar (CalDAV + VTODO tasks), Contacts (CardDAV), Tables, WebDAV,
+ Deck, Cookbook, Mail, News, Talk and Collectives.
+ .
+ This package provides both the importable nextcloud_mcp_server Python
+ module and the nextcloud-mcp-server console script entry point.
+ .
+ NOTE: this package's declared dependencies do not yet cover 6 hard
+ runtime requirements that have no Debian package available in the apt
+ repo yet (fastembed, anthropic, langchain-text-splitters, pymupdf4llm,
+ pypdfium2, qdrant-client).
+ See /usr/share/doc/nextcloud-mcp-server/README.Debian for details.

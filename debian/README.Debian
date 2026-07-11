@@ -1,0 +1,125 @@
+nextcloud-mcp-server for Debian
+================================
+
+Known gap: unpackaged hard runtime dependencies
+-------------------------------------------------
+
+pyproject.toml lists the following as hard (non-optional) runtime
+dependencies. None of them currently has a Debian package available in
+the apt repo, so they are deliberately NOT listed in debian/control's
+Depends field. This package therefore builds and installs, but is not
+yet a fully functional runtime until these are packaged in follow-up
+sessions:
+
+  - fastembed             (pulls in onnxruntime/tokenizers; substantial)
+  - anthropic             (needs `jiter`, a Rust/PyO3 extension)
+  - langchain-text-splitters (needs langchain-core, a large package)
+  - pymupdf4llm
+  - pypdfium2
+  - qdrant-client
+
+qdrant-client has debian/ packaging (source qdrant-client, Jenkins job
+Foregin/qdrant-client) and builds a local .deb cleanly, but is not yet
+published to the apt repo — see "CI publish-step gap" below. Add it back
+to Depends once python3-qdrant-client is installable via apt.
+
+fastembed is blocked on a substantial Rust crate-packaging effort — see
+"fastembed / tokenizers Rust crate gap" below.
+
+CI Test-stage gap: repo.vitexsoftware.com backports 403s block apt installability
+------------------------------------------------------------------------------------
+
+As of 2026-07-11, every sibling OpenTelemetry/mistralai/qdrant-client
+Jenkins job (Foregin/python-opentelemetry-*, Foregin/mistralai,
+Foregin/qdrant-client) fails with a bare "ERROR: script returned exit
+code 100", but the per-distro dpkg-buildpackage build and artifact
+archiving steps succeed first (confirmed via archived .deb artifacts and
+clean build logs with no ValueError/dpkg-buildpackage: error) — the
+packaging itself is correct.
+
+Root cause, confirmed by reading the actual Jenkins Test-stage log
+(Foregin/python-opentelemetry-semantic-conventions build #3): the
+shared Jenkinsfile's "Test <dist>" stage does
+`sudo apt-get -y install python3-<pkg>` inside a fresh
+vitexsoftware/<dist> container against the live apt sources (Debian
+archive + repo.vitexsoftware.com). That install fails with:
+
+  python3-opentelemetry-semantic-conventions : Depends: python3-typing-extensions (>= 4.5.0) but it is not going to be installed
+                                               Depends: python3-opentelemetry-api (>= 1.41.1) but it is not installable
+  E: Unable to correct problems, you have held broken packages.
+
+i.e. python3-opentelemetry-api itself is not cleanly installable in the
+build container, apparently because repo.vitexsoftware.com's backports
+component 404s/403s on every distribution (bookworm/trixie/jammy/
+noble/resolute — visible earlier in the same logs as
+"E: Failed to fetch .../backports/binary-amd64/Packages ... 403
+Forbidden"), and the typing-extensions >= 4.5.0 floor needed by
+opentelemetry-semantic-conventions/opentelemetry-api apparently lives in
+that unreachable backports component. This is a repo-hosting/apt-source
+issue on repo.vitexsoftware.com, not a packaging defect, and not
+specific to any one package — every job in this batch hits it. Fixing
+it needs access to whatever serves repo.vitexsoftware.com's dists/*/
+backports tree (permissions/credentials not available in this
+environment); a Debian package built locally with
+`dpkg-buildpackage -us -uc -b` is correct even though its Jenkins CI
+Test stage cannot currently verify installability end-to-end.
+
+Build fix: unrecognized trove classifiers
+-------------------------------------------
+
+Debian's packaged python3-hatchling (1.27.0) validates PyPI classifiers
+against an older trove-classifiers list that does not recognize
+"Framework :: OpenTelemetry" or "Programming Language :: Python :: 3.13"
+/ "3.14", and raises a hard ValueError during the build backend's
+metadata step. Every opentelemetry-python(-contrib) sibling package's
+debian/rules now strips these classifiers from pyproject.toml in
+override_dh_auto_configure before invoking dh_auto_configure. This one
+resolved the Jenkins bookworm/trixie build failures that had been
+silently masking as "completed" packaging tasks (verified only by local
+dpkg-buildpackage, which uses a newer, more permissive hatchling).
+
+These are left in place in upstream's own pyproject.toml dependency list
+(removing them there would misrepresent what the software actually
+needs); the gap is purely at the Debian packaging level.
+
+fastembed / tokenizers Rust crate gap
+--------------------------------------
+
+fastembed depends on `tokenizers` (HuggingFace's Rust/PyO3 tokenizer
+library) and, transitively via `qdrant-client[fastembed]`-style usage,
+`py-rust-stemmers`. A crate-graph audit (2026-07-09) found ~40-45
+librust-*-dev packages are needed before these can build from source in
+Debian, including:
+
+  - Two INCOMPATIBLE pyo3 lines: py-rust-stemmers needs pyo3 ^0.28.3,
+    tokenizers pins pyo3 0.26.0. Debian's archive only has 0.22.6.
+    Both need packaging as new parallel-version librust-pyo3-0.2X-dev
+    packages (Debian's multi-version crate convention), not in-place
+    bumps to the existing 0.22 line.
+  - Missing leaf crates: serde_core, rust-stemmers, esaxx-rs,
+    spm_precompiled, unicode-normalization-alignments, ndarray, numpy
+    (rust crate), monostate/monostate-impl, jiff-static,
+    macro_rules_attribute(-proc-macro), once_cell_polyfill,
+    pyo3-async-runtimes, rayon-cond, unit-prefix, find-msvc-tools.
+  - Version-incompatible crates needing parallel-version packages
+    (archive-wide in-place bumps are risky — wide reverse-dependency
+    surface): rustix (0.38 -> 1.x major), rustc-hash (1.x -> 2.x major),
+    rand/rand_core/rand_chacha (0.8 -> 0.9), zerocopy/zerocopy-derive
+    (0.7 -> 0.8), getrandom (0.2 -> 0.3), once_cell, heck,
+    target-lexicon, itertools, jiff, memoffset, onig_sys, base64,
+    dary_heap.
+
+This is being worked bottom-up (leaves first) as a dedicated
+sub-effort; see task tracker for current progress. `debcargo` does not
+recurse — each missing/incompatible crate must be packaged manually,
+in dependency order, before its dependents will build.
+
+Build backend note
+-------------------
+
+Upstream builds with `uv_build` (see pyproject.toml [build-system]),
+which is not packaged for Debian. debian/rules patches pyproject.toml at
+build time (override_dh_auto_configure) to use hatchling instead, and
+restores the original pyproject.toml afterwards (override_dh_auto_clean).
+
+ -- Vítězslav Dvořák <info@vitexsoftware.cz>  Wed, 08 Jul 2026 12:03:05 +0200

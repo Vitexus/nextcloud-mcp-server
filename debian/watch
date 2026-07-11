@@ -1,0 +1,3 @@
+version=4
+https://pypi.org/simple/nextcloud-mcp-server/ \
+  .*/nextcloud[-_]mcp[-_]server[-_]@ANY_VERSION@\.tar\.gz
